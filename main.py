@@ -68,7 +68,7 @@ def build_message(data: dict) -> str:
     definitions = []
     for meaning in meanings:
         pos = meaning.get("partOfSpeech", "").upper()
-        definitions.append(f"\n🔹 <b>{part_of_speech}</b>")
+        definitions.append(f"\n🔹 <b>{pos}</b>")  # <--- Fixed variable to 'pos'
         for idx, defn in enumerate(meaning.get("definitions", [])[:2], start=1):
             definitions.append(f"  {idx}. {defn['definition']}")
             
