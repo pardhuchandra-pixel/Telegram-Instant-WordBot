@@ -85,25 +85,40 @@ def send_message(text: str) -> None:
     except requests.RequestException as exc:
         log.error("Telegram fail: %s", exc)
 
-# ── Webhook Endpoint (The Instant Receiver) ──────────────────────────────────
+# ── Webhook Endpoint (The Multi-User Instant Receiver) ───────────────────────
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     try:
         payload = await request.json()
         message = payload.get("message", {})
         text = message.get("text", "").strip()
-        from_id = str(message.get("from", {}).get("id", ""))
         
-        if from_id == CHAT_ID and text and " " not in text and text.isalpha():
+        # 1. Grab the ID of the specific person texting the bot right now
+        sender_id = str(message.get("from", {}).get("id", ""))
+        
+        # 2. Split your CHAT_ID environment variable by commas to check allowed users
+        # Example configuration: "12345678,98765432,55443322"
+        allowed_users = [uid.strip() for uid in CHAT_ID.split(",") if uid.strip()]
+        
+        # 3. Security Guard: Verify the sender is in your authorized list
+        if sender_id in allowed_users and text and " " not in text and text.isalpha():
             word = text.lower()
-            log.info(f"Instant webhook lookup triggered for: '{word}'")
+            log.info(f"Instant webhook lookup triggered by authorized user {sender_id} for: '{word}'")
             
             data = fetch_word_data(word)
             if data:
                 output = build_message(data)
-                send_message(output)
+                
+                # CRITICAL CHANGE: Send the reply back to the SPECIFIC friend who asked, 
+                # not to your personal chat window!
+                url = TELEGRAM_SEND_URL.format(token=BOT_TOKEN)
+                reply_payload = {"chat_id": sender_id, "text": output, "parse_mode": "HTML"}
+                requests.post(url, json=reply_payload, timeout=REQUEST_TIMEOUT).raise_for_status()
             else:
-                send_message(f"⚠️ Could not find dictionary data for: '{word}'")
+                # Send error message back to that specific friend
+                url = TELEGRAM_SEND_URL.format(token=BOT_TOKEN)
+                error_payload = {"chat_id": sender_id, "text": f"⚠️ Could not find dictionary data for: '{word}'", "parse_mode": "HTML"}
+                requests.post(url, json=error_payload, timeout=REQUEST_TIMEOUT).raise_for_status()
                 
     except Exception as e:
         log.error(f"Webhook error processing packet: {e}")
