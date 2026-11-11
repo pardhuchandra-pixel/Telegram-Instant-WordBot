@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 from fastapi import FastAPI, Request
 import requests
@@ -16,74 +17,98 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
-DICTIONARY_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
-
-REQUEST_TIMEOUT = 8
+REQUEST_TIMEOUT = 10
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def bold_word(text: str, word: str) -> str:
     return re.sub(rf"\b({re.escape(word)}[a-z]*)\b", r"<b>\1</b>", text, flags=re.IGNORECASE)
 
-def fetch_word_data(word: str) -> dict | None:
-    url = DICTIONARY_URL.format(word=word)
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        data = resp.json()
-        return data[0] if isinstance(data, list) and data else None
-    except (requests.RequestException, ValueError):
-        return None
+def fetch_word_and_sentences(word: str) -> dict | None:
+    """
+    Uses Gemini to look up the phonetic pronunciation, definitions,
+    and generate 10 natural sentences in a single prompt.
+    """
+    prompt = f"""
+You are a lexicographer and language tutor.
+Analyze the requested English word: "{word}".
 
-def generate_ai_sentences(word: str, meanings: list[dict]) -> str:
-    pos_summary = ", ".join(set([m.get("partOfSpeech", "").lower() for m in meanings]))
-    prompt = (
-        f"Generate exactly 10 diverse, natural, real-world English sentences using the word '{word}'.\n"
-        f"The word acts as these parts of speech: {pos_summary}.\n"
-        f"Return ONLY a clean text list with each sentence starting with a bullet '•'. No extra notes."
-    )
+Provide:
+1. IPA phonetic pronunciation (e.g., "/wɜːd/").
+2. 1-2 concise definitions for each valid part of speech (VERB, NOUN, ADJECTIVE, ADVERB, etc.).
+3. Exactly 10 diverse, natural, real-world example sentences demonstrating the word in context.
+
+Respond ONLY with valid JSON in this exact structure:
+{{
+  "word": "{word}",
+  "phonetic": "/.../",
+  "meanings": [
+    {{
+      "partOfSpeech": "NOUN",
+      "definitions": ["Definition 1", "Definition 2"]
+    }}
+  ],
+  "sentences": [
+    "Sentence 1",
+    "Sentence 2"
+  ]
+}}
+If the text is gibberish or not a real English word, respond with:
+{{"error": "not_a_word"}}
+"""
     try:
         client = genai.Client(api_key=GEMINI_KEY)
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        lines = [line.strip() for line in response.text.strip().splitlines() if line.strip()]
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
         
-        formatted_bullets = []
-        for line in lines:
-            clean_sentence = line.lstrip("•*- ").strip().strip('"')
-            if clean_sentence:
-                formatted_bullets.append(f"  • \"{bold_word(clean_sentence, word)}\"")
-        return "\n".join(formatted_bullets[:10])
+        raw_text = response.text.strip()
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```(?:json)?\n", "", raw_text)
+            raw_text = re.sub(r"\n```$", "", raw_text)
+
+        data = json.loads(raw_text.strip())
+        if data.get("error") == "not_a_word":
+            return None
+        return data
+
     except Exception as exc:
-        log.error("Gemini failed: %s", exc)
-    return "  • <i>(Could not generate AI context sentences.)</i>"
+        log.error("Gemini lookup failed for '%s': %s", word, exc)
+        return None
 
-def build_message(data: dict) -> str:
-    word = data["word"]
-    meanings = data.get("meanings", [])
-    
-    header = f"📚 <b>Requested Word: {word.capitalize()}</b>\n--------------------------------------"
-    
-    definitions = []
-    for meaning in meanings:
+def build_message(word: str, data: dict) -> str:
+    phonetic = data.get("phonetic", "").strip()
+    header = f"📚 <b>Requested Word: {word.capitalize()}</b>"
+    if phonetic:
+        header += f"  <i>{phonetic}</i>"
+    header += "\n--------------------------------------"
+
+    defs_list = []
+    for meaning in data.get("meanings", []):
         pos = meaning.get("partOfSpeech", "").upper()
-        definitions.append(f"\n🔹 <b>{pos}</b>")  # <--- Fixed variable to 'pos'
-        for idx, defn in enumerate(meaning.get("definitions", [])[:2], start=1):
-            definitions.append(f"  {idx}. {defn['definition']}")
-            
-    definitions_block = "\n".join(definitions)
-    sentences_block = "\n💡 <b>Real-World Sample Cases (by Gemini AI):</b>\n" + generate_ai_sentences(word, meanings)
-    
-    return "\n".join(filter(None, [header, definitions_block, sentences_block]))
+        defs_list.append(f"\n🔹 <b>{pos}</b>")
+        for idx, d in enumerate(meaning.get("definitions", [])[:2], start=1):
+            defs_list.append(f"  {idx}. {d}")
+    definitions_block = "\n".join(defs_list)
 
-def send_message(text: str) -> None:
+    sentence_lines = []
+    for s in data.get("sentences", [])[:10]:
+        clean = s.lstrip("•*- 1234567890.").strip().strip('"')
+        if clean:
+            sentence_lines.append(f"  • \"{bold_word(clean, word)}\"")
+    sentences_block = "\n💡 <b>Real-World Sample Cases (by Gemini AI):</b>\n" + "\n".join(sentence_lines)
+
+    return f"{header}\n{definitions_block}\n{sentences_block}"
+
+def reply_telegram(chat_id: str, text: str) -> None:
     url = TELEGRAM_SEND_URL.format(token=BOT_TOKEN)
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=REQUEST_TIMEOUT).raise_for_status()
+        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
     except requests.RequestException as exc:
-        log.error("Telegram fail: %s", exc)
+        log.error("Telegram send fail: %s", exc)
 
 # ── Webhook Endpoint (The Multi-User Instant Receiver) ───────────────────────
 @app.post("/webhook")
@@ -92,36 +117,24 @@ async def telegram_webhook(request: Request):
         payload = await request.json()
         message = payload.get("message", {})
         text = message.get("text", "").strip()
-        
-        # 1. Grab the ID of the specific person texting the bot right now
         sender_id = str(message.get("from", {}).get("id", ""))
         
-        # 2. Split your CHAT_ID environment variable by commas to check allowed users
-        # Example configuration: "12345678,98765432,55443322"
         allowed_users = [uid.strip() for uid in CHAT_ID.split(",") if uid.strip()]
         
-        # 3. Security Guard: Verify the sender is in your authorized list
+        # Check authorization and ensure input is a single alphabetical word
         if sender_id in allowed_users and text and " " not in text and text.isalpha():
             word = text.lower()
-            log.info(f"Instant webhook lookup triggered by authorized user {sender_id} for: '{word}'")
+            log.info("Instant lookup triggered by user %s for: '%s'", sender_id, word)
             
-            data = fetch_word_data(word)
+            data = fetch_word_and_sentences(word)
             if data:
-                output = build_message(data)
-                
-                # CRITICAL CHANGE: Send the reply back to the SPECIFIC friend who asked, 
-                # not to your personal chat window!
-                url = TELEGRAM_SEND_URL.format(token=BOT_TOKEN)
-                reply_payload = {"chat_id": sender_id, "text": output, "parse_mode": "HTML"}
-                requests.post(url, json=reply_payload, timeout=REQUEST_TIMEOUT).raise_for_status()
+                output = build_message(word, data)
+                reply_telegram(sender_id, output)
             else:
-                # Send error message back to that specific friend
-                url = TELEGRAM_SEND_URL.format(token=BOT_TOKEN)
-                error_payload = {"chat_id": sender_id, "text": f"⚠️ Could not find dictionary data for: '{word}'", "parse_mode": "HTML"}
-                requests.post(url, json=error_payload, timeout=REQUEST_TIMEOUT).raise_for_status()
+                reply_telegram(sender_id, f"⚠️ Could not find dictionary data for: '<b>{word}</b>'")
                 
     except Exception as e:
-        log.error(f"Webhook error processing packet: {e}")
+        log.error("Webhook error processing packet: %s", e)
         
     return {"status": "ok"}
 
